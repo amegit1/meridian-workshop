@@ -228,12 +228,15 @@ def get_recent_transactions():
     return recent_transactions
 
 @app.get("/api/reports/quarterly")
-def get_quarterly_reports():
+def get_quarterly_reports(
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None
+):
     """Get quarterly performance reports"""
-    # Calculate quarterly statistics from orders
+    filtered_orders = apply_filters(orders, warehouse, category)
     quarters = {}
 
-    for order in orders:
+    for order in filtered_orders:
         order_date = order.get('order_date', '')
         # Determine quarter
         if '2025-01' in order_date or '2025-02' in order_date or '2025-03' in order_date:
@@ -274,11 +277,15 @@ def get_quarterly_reports():
     return result
 
 @app.get("/api/reports/monthly-trends")
-def get_monthly_trends():
+def get_monthly_trends(
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None
+):
     """Get month-over-month trends"""
+    filtered_orders = apply_filters(orders, warehouse, category)
     months = {}
 
-    for order in orders:
+    for order in filtered_orders:
         order_date = order.get('order_date', '')
         if not order_date:
             continue
@@ -303,6 +310,65 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking")
+def get_restocking_recommendations(
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None
+):
+    """Get restocking recommendations for items below reorder point"""
+    filtered_inventory = apply_filters(inventory_items, warehouse, category)
+
+    # Build SKU -> demand lookup
+    demand_by_sku = {d["item_sku"]: d for d in demand_forecasts}
+
+    recommendations = []
+    for item in filtered_inventory:
+        if item["quantity_on_hand"] >= item["reorder_point"]:
+            continue
+
+        demand = demand_by_sku.get(item["sku"], {})
+        forecasted_demand = demand.get("forecasted_demand", 0)
+        trend = demand.get("trend", "stable")
+
+        # Days of stock remaining based on forecasted demand (30-day window)
+        daily_demand = forecasted_demand / 30 if forecasted_demand > 0 else 0
+        days_remaining = round(item["quantity_on_hand"] / daily_demand) if daily_demand > 0 else 999
+
+        # Suggest enough to reach 2x reorder point
+        suggested_qty = max((item["reorder_point"] * 2) - item["quantity_on_hand"], 1)
+        total_cost = round(suggested_qty * item["unit_cost"], 2)
+
+        if days_remaining < 7:
+            urgency = "critical"
+        elif days_remaining < 14:
+            urgency = "warning"
+        else:
+            urgency = "low"
+
+        recommendations.append({
+            "id": item["id"],
+            "sku": item["sku"],
+            "name": item["name"],
+            "category": item["category"],
+            "warehouse": item["warehouse"],
+            "quantity_on_hand": item["quantity_on_hand"],
+            "reorder_point": item["reorder_point"],
+            "unit_cost": item["unit_cost"],
+            "forecasted_demand": forecasted_demand,
+            "trend": trend,
+            "days_remaining": days_remaining,
+            "suggested_qty": suggested_qty,
+            "total_cost": total_cost,
+            "urgency": urgency
+        })
+
+    # Sort by urgency (critical first, then warning, then low), then by days_remaining
+    urgency_order = {"critical": 0, "warning": 1, "low": 2}
+    recommendations.sort(key=lambda x: (urgency_order[x["urgency"]], x["days_remaining"]))
+
+    return recommendations
+
 
 if __name__ == "__main__":
     import uvicorn
